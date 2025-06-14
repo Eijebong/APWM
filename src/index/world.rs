@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use http::Uri;
 use reqwest::{Client, Url};
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -17,7 +17,7 @@ use std::{
 };
 use tempfile::{tempdir, TempDir};
 
-#[derive(Deserialize, Debug, PartialEq, Default, Clone)]
+#[derive(Deserialize, Debug, PartialEq, Default, Clone, Serialize)]
 pub enum WorldOrigin {
     #[serde(rename = "url")]
     Url(#[serde(with = "http_serde::uri")] Uri),

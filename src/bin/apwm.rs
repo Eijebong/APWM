@@ -1,10 +1,17 @@
 use anyhow::{bail, Context, Result};
-use apwm::diff::diff_world_and_write;
 use apwm::utils::git_clone_shallow;
+use apwm::{diff::diff_world_and_write, WorldOrigin};
 use clap::Parser;
 use reqwest::Url;
 use semver::Version;
-use std::path::{Path, PathBuf};
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
+use std::fs::File;
+use std::io::Write;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use tempfile::tempdir;
 
 #[derive(clap::Subcommand)]
@@ -40,8 +47,6 @@ enum Command {
         from_ref: Option<String>,
         #[clap(short)]
         output: PathBuf,
-        #[clap(short)]
-        lobby_url: Option<Url>,
     },
 }
 
@@ -79,14 +84,12 @@ async fn main() -> Result<()> {
             from,
             from_ref,
             output,
-            lobby_url,
         } => {
-            if lobby_url.is_some() {
-                if std::env::var("LOBBY_API_KEY").is_err() {
-                    bail!("Lobby url specified but missing `LOBBY_API_KEY` env variable");
-                }
-            }
-            diff(&index_path, &from, &from_ref, &output, &lobby_url).await?;
+            let index_diff = diff(&index_path, &from, &from_ref, &output).await?;
+            let serialized = serde_json::to_string(&index_diff)?;
+            let output_path = output.join("apdiff.diff");
+            let mut file = File::create(&output_path)?;
+            file.write_all(serialized.as_bytes())?;
         }
     }
 
@@ -115,13 +118,36 @@ async fn update(index_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize)]
+pub enum ApworldDiff {
+    Added(Version, Option<String>),
+    Removed(Version),
+}
+
+#[derive(Default)]
+pub struct IndexDiff(HashMap<String, Vec<ApworldDiff>>);
+
+impl Serialize for IndexDiff {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            if !value.is_empty() {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
 async fn diff(
     index_path: &Path,
     from_git_remote: &str,
     from_git_ref: &Option<String>,
     output: &Path,
-    lobby_url: &Option<Url>,
-) -> Result<()> {
+) -> Result<IndexDiff> {
     let old_index_dir = tempdir()?;
     git_clone_shallow(
         from_git_remote,
@@ -129,80 +155,55 @@ async fn diff(
         old_index_dir.path(),
     )?;
 
-    let new_index_toml = index_path.join("index.toml");
-    let old_index_toml = old_index_dir.path().join("index.toml");
-    let old_index_lock = old_index_dir.path().join("index.lock");
+    let mut index_diff = IndexDiff::default();
 
+    let new_index_toml = index_path.join("index.toml");
     let new_index = apwm::Index::new(&new_index_toml)?;
+
+    // This will update the lockfile
+    let new_index_lock = new_index.refresh_into(output, true, None).await?;
+    new_index_lock.write()?;
+
+    let old_index_toml = old_index_dir.path().join("index.toml");
     let old_index = apwm::Index::new(&old_index_toml)?;
-    let old_index_lock = apwm::IndexLock::new(&old_index_lock)?;
 
     let old_worlds = old_index.worlds;
     let new_worlds = new_index.worlds;
 
     for (name, world) in &new_worlds {
+        let mut versions = index_diff.0.entry(name.to_string()).or_default();
+
         match old_worlds.get(name) {
             // This is a new world, diff from nothing
             None => {
-                let mut from = None;
-
-                // If the new world is a manual and we're diffing it from nothing, try diffing it
-                // against an empty manual instead. This will provide a lot of relief on reviewing
-                // effort.
-                if world.name.starts_with("Manual_") {
-                    from = new_worlds.get("manual_ultimatemarvelvscapcom3_manualteam");
+                for (version, origin) in &world.versions {
+                    let checksum = new_index_lock.get_checksum(name, version);
+                    versions.push(ApworldDiff::Added(version.clone(), checksum));
                 }
-                diff_world_and_write(
-                    from,
-                    Some(world),
-                    name,
-                    output,
-                    &new_index.archipelago_repo.to_string(),
-                    &new_index.archipelago_version.to_string(),
-                    &old_index_lock,
-                    lobby_url,
-                )
-                .await?
             }
             // The world was already there before, diff from latest version
             Some(old_world) => {
-                if world.versions.keys().collect::<Vec<_>>()
-                    == old_world.versions.keys().collect::<Vec<_>>()
-                {
-                    continue;
+                for (version, origin) in &world.versions {
+                    if old_world.versions.contains_key(version) {
+                        continue;
+                    }
+                    let checksum = new_index_lock.get_checksum(name, version);
+                    versions.push(ApworldDiff::Added(version.clone(), checksum));
                 }
-                diff_world_and_write(
-                    Some(old_world),
-                    Some(world),
-                    name,
-                    output,
-                    &new_index.archipelago_repo.to_string(),
-                    &new_index.archipelago_version.to_string(),
-                    &old_index_lock,
-                    lobby_url,
-                )
-                .await?
             }
         }
     }
 
     for (name, world) in &old_worlds {
+        let mut versions = index_diff.0.entry(name.to_string()).or_default();
         if !new_worlds.contains_key(name.as_str()) {
-            diff_world_and_write(
-                Some(world),
-                None,
-                name,
-                output,
-                &new_index.archipelago_repo.to_string(),
-                &new_index.archipelago_version.to_string(),
-                &old_index_lock,
-                lobby_url,
-            )
-            .await?;
+            for version in old_worlds[name].versions.keys() {
+                versions.push(ApworldDiff::Removed(version.clone()));
+            }
         }
     }
 
-    Ok(())
+    Ok(index_diff)
 }
 
 fn apworld_version_from_precise(precise: &Option<String>) -> Result<Option<(String, Version)>> {

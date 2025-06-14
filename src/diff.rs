@@ -68,7 +68,7 @@ pub async fn diff_world_and_write(
     ap_index_ref: &str,
     index_lock: &IndexLock,
     lobby_url: &Option<Url>,
-) -> Result<()> {
+) -> Result<CombinedDiff> {
     let diff = diff_world(from, to, ap_index_url, ap_index_ref, index_lock, lobby_url).await?;
 
     std::fs::create_dir_all(destination)?;
@@ -78,7 +78,7 @@ pub async fn diff_world_and_write(
     serde_path_to_error::serialize(&diff, serializer)?;
     std::fs::write(file_path, out)?;
 
-    Ok(())
+    Ok(diff)
 }
 
 async fn diff_world(
